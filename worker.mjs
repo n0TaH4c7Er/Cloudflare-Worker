@@ -88,8 +88,8 @@ export class RelayHub {
   const used=Number(row.requests),cutoff=Math.min(90000,Math.max(1000,Number(this.env.NEW_SESSION_CUTOFF)||60000));
   const retryAfter=Math.max(1,Math.ceil((Date.parse(day+'T00:00:00Z')+86400000-Date.now())/1000));
   const path=new URL(request.url).pathname;
-  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-gust-pool2',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
-  if(request.method==='POST'&&path==='/sessions'&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
+  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-gust-pool3',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
+  if(request.method==='POST'&&['/sessions','/cloudmoon-servers'].includes(path)&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
   return new Promise(resolve=>{const res=new HttpResponse(resolve);request.signal.addEventListener('abort',()=>res.abort(),{once:true});Promise.resolve(this.handler(requestAdapter(request),res)).catch(error=>{if(!res.headersSent){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Relay request failed'}));}else res.abort();});});
  }
 }
@@ -248,7 +248,7 @@ class HttpWorldDataSocket extends EventTarget{
 }
 
 
-const VERSION='2026-11-01.cloudflare-gust-pool2';
+const VERSION='2026-11-01.cloudflare-gust-pool3';
 const targets=new Set((env.ALLOWED_TARGETS||'').split(',').map(x=>x.trim()).filter(Boolean).map(x=>x==='*'?x:new URL(x).href));
 const instanceId=randomUUID(),closedSessions=new Map();
 const key=env.RELAY_KEY,sessions=new Map(),limit=2097152,queueLimit=8*1024*1024;
@@ -323,12 +323,19 @@ const handler=async(req,res)=>{
  res.setHeader('Cache-Control','no-store');
  res.setHeader('Access-Control-Max-Age','600');
  const reply=(code,data)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
- if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true});return;}
+ if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true});return;}
  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
  if(req.headers['x-relay-key']!==key){reply(401,{error:'Invalid relay key'});return;}
  try{
   const path=new URL(req.url,'http://relay').pathname;let body={};
   if(req.method==='POST'){let size=0,chunks=[];for await(const c of req){size+=c.length;if(size>limit){reply(413,{error:'Too large'});return;}chunks.push(c);}const raw=Buffer.concat(chunks);body=req.headers['content-type']?.split(';')[0]==='application/octet-stream'?decodeBatch(raw):JSON.parse(raw.toString()||'{}');}
+  if(path==='/cloudmoon-servers'&&req.method==='POST'){
+   const controller=new AbortController();
+   res.on('close',()=>controller.abort());
+   try{reply(200,await cloudMoonServers(body,controller.signal));}
+   catch(error){if(!res.writableEnded&&!res.destroyed)reply(502,{error:'CloudMoon public server list is unavailable'});}
+   return;
+  }
   if(path==='/sessions'&&req.method==='POST'){
    if(!['shared-world','world-data','gust-wisp'].includes(body.kind)&&!targets.has('*')&&!targets.has(body.url)){reply(403,{error:'Server URL is not allowed'});return;}
    if(sessions.size>=12){reply(503,{error:'Relay full'});return;}
@@ -339,7 +346,7 @@ const handler=async(req,res)=>{
    ws.addEventListener('error',e=>{console.error('[relay]',s.id,'Upstream error:',e.message||e.error?.message||'Unknown error');push(s,{type:'error',reason:e.message||'Upstream connection failed'});});
    ws.addEventListener('close',e=>{s.endReason='Game server closed connection ('+e.code+')'+(e.reason?': '+e.reason:'');console.log('[relay]',s.id,'Upstream closed:',e.code,e.reason);push(s,{type:'close',code:e.code,reason:e.reason,wasClean:e.wasClean});});
    if(ws.connection){await ws.connection;if(ws.readyState!==1){dispose(s,'Upstream connection failed before opening');reply(503,{error:'Cloudflare upstream connection failed; try fallback',retryAfter:60});return;}}
-   reply(201,{id:s.id,protocol:s.binary?3:2,binaryTransport:s.binary,version:VERSION,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true});return;
+   reply(201,{id:s.id,protocol:s.binary?3:2,binaryTransport:s.binary,version:VERSION,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true});return;
   }
   const m=path.match(/^\/sessions\/([a-f0-9-]+)(\/send|\/ack|\/stream|\/status)?$/),s=m&&sessions.get(m[1]);
   if(!s){const ended=m&&closedSessions.get(m[1]);reply(ended?410:404,{error:ended?ended.reason:'Session not found; the relay may have restarted',instanceId});return;}s.last=Date.now();
@@ -412,5 +419,37 @@ function clean(){
 }
 function schedule(){if(sweeper!==null||!sessions.size)return;sweeper=setTimeout(()=>{sweeper=null;clean();schedule();},10000);}
 return async(req,res)=>{clean();try{return await handler(req,res);}finally{schedule();}};
+}
+
+
+// Public, read-only server discovery. No client-supplied destination, credentials,
+// cookies, login bodies or account mutations are forwarded by this route.
+async function cloudMoonServers(body={}, signal) {
+ const hosts=['https://api.prod.cloudmoonapp.com','https://api.cloudmoon.cloudbatata.com','https://api.prod.geometry.today','https://hrz5zfjq02.execute-api.us-east-1.amazonaws.com','https://api.prod.viewoncloud.com'];
+ if(typeof body.query!=='string'||body.query.length>4096)throw Error('Invalid server-list query');
+ const incoming=new URLSearchParams(body.query),query=new URLSearchParams();
+ for(const name of ['device_type','site','query_uuid','device_id']){
+  const value=incoming.get(name);if(value!==null&&value.length<=200)query.set(name,value);
+ }
+ query.set('device_type','web');query.set('site','cm');
+ const headers=new Headers({Accept:'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'});
+ for(const name of ['x-user-language','x-user-locale']){
+  const value=body.headers?.[name];if(typeof value==='string'&&value.length<=100&&!/[\r\n]/.test(value))headers.set(name,value);
+ }
+ for(const host of hosts){
+  if(signal?.aborted)throw signal.reason||Error('Request cancelled');
+  try{
+   const combined=signal?AbortSignal.any([signal,AbortSignal.timeout(6000)]):AbortSignal.timeout(6000);
+   const response=await fetch(host+'/game/server_list?'+query,{method:'GET',headers,redirect:'manual',signal:combined});
+   if(!response.ok){await response.body?.cancel();continue;}
+   const reader=response.body.getReader(),chunks=[];let size=0;
+   for(;;){const {value,done}=await reader.read();if(done)break;size+=value.length;if(size>128*1024){await reader.cancel();throw Error('Server list too large');}chunks.push(value);}
+   const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
+   const data=JSON.parse(new TextDecoder().decode(bytes));
+   if(data.code!==0||!Array.isArray(data.data?.list))continue;
+   return data;
+  }catch(error){if(signal?.aborted)throw error;}
+ }
+ throw Error('CloudMoon public server list is unavailable');
 }
 
