@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cloudflare-worker",
+  "name": "eaglercraft-cloudflare",
   "main": "worker.mjs",
   "compatibility_date": "2026-08-01",
   "compatibility_flags": [
@@ -8,7 +8,7 @@
   ],
   "workers_dev": true,
   "vars": {
-    "ALLOWED_TARGETS": "*",
+    "ALLOWED_TARGETS": "wss://eagler.carrot-craft.org/",
     "NEW_SESSION_CUTOFF": "60000",
     "GUST_WISP_URL": "wss://wisp.mercurywork.shop/"
   },

@@ -44,6 +44,36 @@ function upstreamFactory(ctx){return class Upstream extends EventTarget {
  close(){if(this.readyState===3)return;this.readyState=3;try{this.socket?.close(1000,'Client closed');}catch{}}
 };}
 
+
+// Validate Wisp v1 before accepting a proxy session, so a bad upstream permits
+// the client to try its next Cloudflare endpoint or Render before sending TLS.
+function wispUpstreamFactory(Upstream,ctx){return class WispUpstream extends EventTarget {
+ constructor(url){
+  super();this.readyState=0;this.protocol='';this.binaryType='arraybuffer';
+  this.connection=new Promise(resolve=>this.resolveConnect=resolve);
+  this.raw=new Upstream(url);this.timer=setTimeout(()=>this.fail('WISP initial handshake timed out'),22000);
+  this.raw.addEventListener('message',event=>{
+   if(this.readyState===3)return;
+   if(this.readyState===0){
+    const bytes=typeof event.data==='string'?null:new Uint8Array(event.data);
+    if(!bytes||bytes.length!==9||bytes[0]!==3||new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint32(1,true)!==0||new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint32(5,true)===0){this.fail('WISP v1 initial handshake rejected');return;}
+    clearTimeout(this.timer);this.readyState=1;this.dispatchEvent(new Event('open'));this.resolveConnect();
+   }
+   this.dispatchEvent(new MessageEvent('message',{data:event.data}));
+  });
+  this.raw.addEventListener('error',event=>this.fail(event.message||'WISP connection failed'));
+  this.raw.addEventListener('close',event=>this.finish(event.code||1006,event.reason||'WISP upstream closed',!!event.wasClean));
+  ctx.waitUntil(this.connection);
+ }
+ send(data){if(this.readyState!==1)throw Error('WISP socket is not open');this.raw.send(data);}
+ fail(reason){if(this.readyState===3)return;const e=new Event('error');Object.defineProperty(e,'message',{value:reason});this.dispatchEvent(e);this.finish(1006,reason,false);}
+ finish(code=1000,reason='',wasClean=true){
+  if(this.readyState===3)return;this.readyState=3;clearTimeout(this.timer);this.raw.close();this.resolveConnect();
+  const e=new Event('close');Object.assign(e,{code,reason,wasClean});this.dispatchEvent(e);
+ }
+ close(){this.finish();}
+};}
+
 // Every account uses ONE named object, so shared worlds and data sessions meet in
 // the same stateful instance. State is transient: deploy/restarts disconnect games.
 export class RelayHub {
@@ -58,7 +88,7 @@ export class RelayHub {
   const used=Number(row.requests),cutoff=Math.min(90000,Math.max(1000,Number(this.env.NEW_SESSION_CUTOFF)||60000));
   const retryAfter=Math.max(1,Math.ceil((Date.parse(day+'T00:00:00Z')+86400000-Date.now())/1000));
   const path=new URL(request.url).pathname;
-  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-pool1',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
+  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-gust-pool2',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
   if(request.method==='POST'&&path==='/sessions'&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
   return new Promise(resolve=>{const res=new HttpResponse(resolve);request.signal.addEventListener('abort',()=>res.abort(),{once:true});Promise.resolve(this.handler(requestAdapter(request),res)).catch(error=>{if(!res.headersSent){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Relay request failed'}));}else res.abort();});});
  }
@@ -73,6 +103,8 @@ export default {async fetch(request,env){
 
 function createRelay(env,ctx){
  const WebSocket=upstreamFactory(ctx);
+ const WispUpstream=wispUpstreamFactory(WebSocket,ctx);
+ const GUST_WISP_URL=env.GUST_WISP_URL||'wss://wisp.mercurywork.shop/';
 const startedAt=Date.now();
 // Eaglercraft shared-world relay protocol v1; no client-IP matching.
 
@@ -216,7 +248,7 @@ class HttpWorldDataSocket extends EventTarget{
 }
 
 
-const VERSION='2026-11-01.cloudflare-pool1';
+const VERSION='2026-11-01.cloudflare-gust-pool2';
 const targets=new Set((env.ALLOWED_TARGETS||'').split(',').map(x=>x.trim()).filter(Boolean).map(x=>x==='*'?x:new URL(x).href));
 const instanceId=randomUUID(),closedSessions=new Map();
 const key=env.RELAY_KEY,sessions=new Map(),limit=2097152,queueLimit=8*1024*1024;
@@ -291,23 +323,23 @@ const handler=async(req,res)=>{
  res.setHeader('Cache-Control','no-store');
  res.setHeader('Access-Control-Max-Age','600');
  const reply=(code,data)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
- if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true});return;}
+ if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true});return;}
  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
  if(req.headers['x-relay-key']!==key){reply(401,{error:'Invalid relay key'});return;}
  try{
   const path=new URL(req.url,'http://relay').pathname;let body={};
   if(req.method==='POST'){let size=0,chunks=[];for await(const c of req){size+=c.length;if(size>limit){reply(413,{error:'Too large'});return;}chunks.push(c);}const raw=Buffer.concat(chunks);body=req.headers['content-type']?.split(';')[0]==='application/octet-stream'?decodeBatch(raw):JSON.parse(raw.toString()||'{}');}
   if(path==='/sessions'&&req.method==='POST'){
-   if(!['shared-world','world-data'].includes(body.kind)&&!targets.has('*')&&!targets.has(body.url)){reply(403,{error:'Server URL is not allowed'});return;}
+   if(!['shared-world','world-data','gust-wisp'].includes(body.kind)&&!targets.has('*')&&!targets.has(body.url)){reply(403,{error:'Server URL is not allowed'});return;}
    if(sessions.size>=12){reply(503,{error:'Relay full'});return;}
-   const ws=body.kind==='world-data'?new HttpWorldDataSocket(body.role,body.link):body.kind==='shared-world'?new SharedWorldSocket():new WebSocket(body.url,body.protocols||[],{perMessageDeflate:false,handshakeTimeout:15000,maxPayload:32*1024*1024}),s={id:randomUUID(),ws,events:[],bytes:0,last:Date.now(),seq:0,eventSeq:0,acked:0,binary:body.binaryTransport===true};
+   const ws=body.kind==='gust-wisp'?new WispUpstream(GUST_WISP_URL):body.kind==='world-data'?new HttpWorldDataSocket(body.role,body.link):body.kind==='shared-world'?new SharedWorldSocket():new WebSocket(body.url,body.protocols||[],{perMessageDeflate:false,handshakeTimeout:15000,maxPayload:32*1024*1024}),s={id:randomUUID(),ws,events:[],bytes:0,last:Date.now(),seq:0,eventSeq:0,acked:0,binary:body.binaryTransport===true};
    sessions.set(s.id,s);ws.binaryType='arraybuffer';console.log('[relay]',s.id,'Connecting to',body.url);
    ws.addEventListener('open',()=>push(s,{type:'open',protocol:ws.protocol}));
    ws.addEventListener('message',e=>push(s,typeof e.data==='string'?{type:'message',text:e.data}:s.binary?{type:'message',bytes:Buffer.from(e.data)}:{type:'message',base64:Buffer.from(e.data).toString('base64')}));
    ws.addEventListener('error',e=>{console.error('[relay]',s.id,'Upstream error:',e.message||e.error?.message||'Unknown error');push(s,{type:'error',reason:e.message||'Upstream connection failed'});});
    ws.addEventListener('close',e=>{s.endReason='Game server closed connection ('+e.code+')'+(e.reason?': '+e.reason:'');console.log('[relay]',s.id,'Upstream closed:',e.code,e.reason);push(s,{type:'close',code:e.code,reason:e.reason,wasClean:e.wasClean});});
    if(ws.connection){await ws.connection;if(ws.readyState!==1){dispose(s,'Upstream connection failed before opening');reply(503,{error:'Cloudflare upstream connection failed; try fallback',retryAfter:60});return;}}
-   reply(201,{id:s.id,protocol:s.binary?3:2,binaryTransport:s.binary,version:VERSION,sharedWorlds:true,httpWorlds:true,receiveStream:true});return;
+   reply(201,{id:s.id,protocol:s.binary?3:2,binaryTransport:s.binary,version:VERSION,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true});return;
   }
   const m=path.match(/^\/sessions\/([a-f0-9-]+)(\/send|\/ack|\/stream|\/status)?$/),s=m&&sessions.get(m[1]);
   if(!s){const ended=m&&closedSessions.get(m[1]);reply(ended?410:404,{error:ended?ended.reason:'Session not found; the relay may have restarted',instanceId});return;}s.last=Date.now();
