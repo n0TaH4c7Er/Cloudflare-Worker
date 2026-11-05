@@ -472,8 +472,11 @@ const PATHS=new Set(['/_ping','/web/game_config','/web/sid']);
 async function cloudMoonRead(body,signal){
  const url=new URL(body?.url);
  const imageResource=(['cloudmoon.tos-ap-southeast-1.volces.com','cloudmoon-1305370474.cos.ap-singapore.myqcloud.com'].includes(url.hostname)||url.hostname==='web.cloudmoonapp.com'&&url.pathname.startsWith('/images/'))&&/[.](?:webp|png|jpe?g|gif|svg)$/.test(url.pathname);
- const staticResource=imageResource||url.hostname==='web.cloudmoonapp.com'&&/^[/](?:run-site[/])?_app[/]immutable[/]/.test(url.pathname)&&/[.](?:js|css|woff2?|svg|png|webp)$/.test(url.pathname);
+ const playerDocument=url.hostname==='web.cloudmoonapp.com'&&['/run-site/','/run-site/index.html'].includes(url.pathname);
+ const staticResource=playerDocument||imageResource||url.hostname==='web.cloudmoonapp.com'&&/^[/](?:run-site[/])?_app[/]immutable[/]/.test(url.pathname)&&/[.](?:js|css|woff2?|svg|png|webp)$/.test(url.pathname);
  if(url.protocol!=='https:'||url.username||url.password||url.port||!(staticResource||(HOSTS.has(url.hostname)&&PATHS.has(url.pathname)))||url.href.length>8192)throw Error('Player API URL is not allowed');
+ // Player HTML is public and static. Session verification happens separately.
+ if(playerDocument){url.pathname='/run-site/';url.search='';}
  const combined=signal?AbortSignal.any([signal,AbortSignal.timeout(10000)]):AbortSignal.timeout(10000);
  const response=await fetch(url,{headers:{Accept:staticResource?'*/*':'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'},redirect:'manual',signal:combined});
  const reader=response.body?.getReader();let size=0;const chunks=[];
