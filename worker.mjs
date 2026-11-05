@@ -88,8 +88,8 @@ export class RelayHub {
   const used=Number(row.requests),cutoff=Math.min(90000,Math.max(1000,Number(this.env.NEW_SESSION_CUTOFF)||60000));
   const retryAfter=Math.max(1,Math.ceil((Date.parse(day+'T00:00:00Z')+86400000-Date.now())/1000));
   const path=new URL(request.url).pathname;
-  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-gust-pool4',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
-  if(request.method==='POST'&&['/sessions','/cloudmoon-servers','/cloudmoon-read'].includes(path)&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
+  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-gust-pool4',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
+  if(request.method==='POST'&&['/sessions','/cloudmoon-servers','/cloudmoon-read','/cloudmoon-api'].includes(path)&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
   return new Promise(resolve=>{const res=new HttpResponse(resolve);request.signal.addEventListener('abort',()=>res.abort(),{once:true});Promise.resolve(this.handler(requestAdapter(request),res)).catch(error=>{if(!res.headersSent){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Relay request failed'}));}else res.abort();});});
  }
 }
@@ -323,12 +323,18 @@ const handler=async(req,res)=>{
  res.setHeader('Cache-Control','no-store');
  res.setHeader('Access-Control-Max-Age','600');
  const reply=(code,data)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
- if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true});return;}
+ if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true});return;}
  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
  if(req.headers['x-relay-key']!==key){reply(401,{error:'Invalid relay key'});return;}
  try{
   const path=new URL(req.url,'http://relay').pathname;let body={};
   if(req.method==='POST'){let size=0,chunks=[];for await(const c of req){size+=c.length;if(size>limit){reply(413,{error:'Too large'});return;}chunks.push(c);}const raw=Buffer.concat(chunks);body=req.headers['content-type']?.split(';')[0]==='application/octet-stream'?decodeBatch(raw):JSON.parse(raw.toString()||'{}');}
+  if(path==='/cloudmoon-api'&&req.method==='POST'){
+   const controller=new AbortController();res.on('close',()=>controller.abort());
+   try{reply(200,await cloudMoonApi(body,controller.signal));}
+   catch(error){if(!res.writableEnded&&!res.destroyed)reply(502,{error:'CloudMoon account/session HTTPS request failed. It was not retried by this relay.'});}
+   return;
+  }
   if(path==='/cloudmoon-read'&&req.method==='POST'){
    const controller=new AbortController();res.on('close',()=>controller.abort());
    try{reply(200,await cloudMoonRead(body,controller.signal));}
@@ -352,7 +358,7 @@ const handler=async(req,res)=>{
    ws.addEventListener('error',e=>{console.error('[relay]',s.id,'Upstream error:',e.message||e.error?.message||'Unknown error');push(s,{type:'error',reason:e.message||'Upstream connection failed'});});
    ws.addEventListener('close',e=>{s.endReason='Game server closed connection ('+e.code+')'+(e.reason?': '+e.reason:'');console.log('[relay]',s.id,'Upstream closed:',e.code,e.reason);push(s,{type:'close',code:e.code,reason:e.reason,wasClean:e.wasClean});});
    if(ws.connection){await ws.connection;if(ws.readyState!==1){dispose(s,'Upstream connection failed before opening');reply(503,{error:'Cloudflare upstream connection failed; try fallback',retryAfter:60});return;}}
-   reply(201,{id:s.id,protocol:s.binary?3:2,binaryTransport:s.binary,version:VERSION,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true});return;
+   reply(201,{id:s.id,protocol:s.binary?3:2,binaryTransport:s.binary,version:VERSION,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true});return;
   }
   const m=path.match(/^\/sessions\/([a-f0-9-]+)(\/send|\/ack|\/stream|\/status)?$/),s=m&&sessions.get(m[1]);
   if(!s){const ended=m&&closedSessions.get(m[1]);reply(ended?410:404,{error:ended?ended.reason:'Session not found; the relay may have restarted',instanceId});return;}s.last=Date.now();
@@ -465,7 +471,7 @@ const PATHS=new Set(['/_ping','/web/game_config','/web/sid']);
 // Read-only player startup. No login, purchase, mutation, or reward endpoint.
 async function cloudMoonRead(body,signal){
  const url=new URL(body?.url);
- const imageResource=url.hostname==='cloudmoon.tos-ap-southeast-1.volces.com'&&/[.](?:webp|png|jpe?g|gif|svg)$/.test(url.pathname);
+ const imageResource=(['cloudmoon.tos-ap-southeast-1.volces.com','cloudmoon-1305370474.cos.ap-singapore.myqcloud.com'].includes(url.hostname)||url.hostname==='web.cloudmoonapp.com'&&url.pathname.startsWith('/images/'))&&/[.](?:webp|png|jpe?g|gif|svg)$/.test(url.pathname);
  const staticResource=imageResource||url.hostname==='web.cloudmoonapp.com'&&/^[/](?:run-site[/])?_app[/]immutable[/]/.test(url.pathname)&&/[.](?:js|css|woff2?|svg|png|webp)$/.test(url.pathname);
  if(url.protocol!=='https:'||url.username||url.password||url.port||!(staticResource||(HOSTS.has(url.hostname)&&PATHS.has(url.pathname)))||url.href.length>8192)throw Error('Player API URL is not allowed');
  const combined=signal?AbortSignal.any([signal,AbortSignal.timeout(10000)]):AbortSignal.timeout(10000);
@@ -477,3 +483,24 @@ async function cloudMoonRead(body,signal){
  return {status:response.status,headers:{'content-type':response.headers.get('content-type')||'application/octet-stream'},data:btoa(binary)};
 }
 
+
+
+// Authenticated native HTTPS transport for explicit CloudMoon account/session APIs.
+// Never log request bodies, tokens or upstream response bodies.
+async function cloudMoonApi(body, signal){
+ const url=new URL(body?.url),method=String(body?.method||'GET').toUpperCase();
+ const hosts=new Set(['api.prod.cloudmoonapp.com','api.cloudmoon.cloudbatata.com','api.prod.geometry.today','hrz5zfjq02.execute-api.us-east-1.amazonaws.com','api.prod.viewoncloud.com']);
+ const getPaths=new Set(['/phone/list','/user/info','/game/category','/game/category_info','/game/check_wish_list','/game/guest_list','/game/info','/game/list','/game/recommend','/game/record','/game/simple_list','/game/wish_list']);
+ const postPaths=new Set(['/login/pwd','/phone/connect','/phone/disconnect']);
+ if(url.protocol!=='https:'||url.username||url.password||url.port||url.hash||url.href.length>8192||!hosts.has(url.hostname)||!(method==='GET'&&getPaths.has(url.pathname)||method==='POST'&&postPaths.has(url.pathname)))throw Error('CloudMoon API operation is not allowed');
+ const headers=new Headers({Accept:'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'});
+ for(const [key,value]of Object.entries(body.headers||{}))if(['content-type','x-user-token','x-user-language','x-user-locale'].includes(key.toLowerCase())&&typeof value==='string'&&value.length<=8192&&!/[\r\n]/.test(value))headers.set(key,value);
+ if(method==='POST'&&(typeof body.body!=='string'||new TextEncoder().encode(body.body).length>65536))throw Error('Invalid CloudMoon API body');
+ const response=await fetch(url,{method,headers,body:method==='POST'?body.body:undefined,redirect:'manual',signal:signal?AbortSignal.any([signal,AbortSignal.timeout(12000)]):AbortSignal.timeout(12000)});
+ if(response.status>=300&&response.status<400){await response.body?.cancel();throw Error('CloudMoon API redirect refused');}
+ const chunks=[];let size=0;const reader=response.body?.getReader();
+ if(reader)for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>512*1024){await reader.cancel();throw Error('CloudMoon API response too large');}chunks.push(value);}
+ const bytes=new Uint8Array(size);let at=0;for(const chunk of chunks){bytes.set(chunk,at);at+=chunk.length;}
+ let binary='';for(let i=0;i<bytes.length;i+=32768)binary+=String.fromCharCode(...bytes.subarray(i,i+32768));
+ return {status:response.status,headers:{'content-type':response.headers.get('content-type')||'application/json','cache-control':'no-store'},data:btoa(binary)};
+}
