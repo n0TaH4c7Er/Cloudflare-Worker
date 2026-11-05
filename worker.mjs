@@ -438,7 +438,7 @@ async function cloudMoonServers(body={}, signal) {
   const value=incoming.get(name);if(value!==null&&value.length<=200)query.set(name,value);
  }
  query.set('device_type','web');query.set('site','cm');
- const headers=new Headers({Accept:'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'});
+ const headers=new Headers({Accept:staticResource?'*/*':'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'});
  for(const name of ['x-user-language','x-user-locale']){
   const value=body.headers?.[name];if(typeof value==='string'&&value.length<=100&&!/[\r\n]/.test(value))headers.set(name,value);
  }
@@ -465,11 +465,12 @@ const PATHS=new Set(['/_ping','/web/game_config','/web/sid']);
 // Read-only player startup. No login, purchase, mutation, or reward endpoint.
 async function cloudMoonRead(body,signal){
  const url=new URL(body?.url);
- if(url.protocol!=='https:'||url.username||url.password||url.port||!HOSTS.has(url.hostname)||!PATHS.has(url.pathname)||url.href.length>8192)throw Error('Player API URL is not allowed');
+ const staticResource=url.hostname==='web.cloudmoonapp.com'&&/^[/](?:run-site[/])?_app[/]immutable[/]/.test(url.pathname)&&/[.](?:js|css|woff2?|svg|png|webp)$/.test(url.pathname);
+ if(url.protocol!=='https:'||url.username||url.password||url.port||!(staticResource||(HOSTS.has(url.hostname)&&PATHS.has(url.pathname)))||url.href.length>8192)throw Error('Player API URL is not allowed');
  const combined=signal?AbortSignal.any([signal,AbortSignal.timeout(10000)]):AbortSignal.timeout(10000);
- const response=await fetch(url,{headers:{Accept:'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'},redirect:'manual',signal:combined});
+ const response=await fetch(url,{headers:{Accept:staticResource?'*/*':'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'},redirect:'manual',signal:combined});
  const reader=response.body?.getReader();let size=0;const chunks=[];
- if(reader)for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>256*1024){await reader.cancel();throw Error('Player API response too large');}chunks.push(value);}
+ if(reader)for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>(staticResource?8*1024*1024:256*1024)){await reader.cancel();throw Error('Player API response too large');}chunks.push(value);}
  const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
  let binary='';for(let i=0;i<bytes.length;i+=32768)binary+=String.fromCharCode(...bytes.subarray(i,i+32768));
  return {status:response.status,headers:{'content-type':response.headers.get('content-type')||'application/octet-stream'},data:btoa(binary)};
