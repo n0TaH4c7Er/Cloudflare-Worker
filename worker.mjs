@@ -465,7 +465,8 @@ const PATHS=new Set(['/_ping','/web/game_config','/web/sid']);
 // Read-only player startup. No login, purchase, mutation, or reward endpoint.
 async function cloudMoonRead(body,signal){
  const url=new URL(body?.url);
- const staticResource=url.hostname==='web.cloudmoonapp.com'&&/^[/](?:run-site[/])?_app[/]immutable[/]/.test(url.pathname)&&/[.](?:js|css|woff2?|svg|png|webp)$/.test(url.pathname);
+ const imageResource=url.hostname==='cloudmoon.tos-ap-southeast-1.volces.com'&&/[.](?:webp|png|jpe?g|gif|svg)$/.test(url.pathname);
+ const staticResource=imageResource||url.hostname==='web.cloudmoonapp.com'&&/^[/](?:run-site[/])?_app[/]immutable[/]/.test(url.pathname)&&/[.](?:js|css|woff2?|svg|png|webp)$/.test(url.pathname);
  if(url.protocol!=='https:'||url.username||url.password||url.port||!(staticResource||(HOSTS.has(url.hostname)&&PATHS.has(url.pathname)))||url.href.length>8192)throw Error('Player API URL is not allowed');
  const combined=signal?AbortSignal.any([signal,AbortSignal.timeout(10000)]):AbortSignal.timeout(10000);
  const response=await fetch(url,{headers:{Accept:staticResource?'*/*':'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'},redirect:'manual',signal:combined});
