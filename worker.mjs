@@ -438,7 +438,7 @@ async function cloudMoonServers(body={}, signal) {
   const value=incoming.get(name);if(value!==null&&value.length<=200)query.set(name,value);
  }
  query.set('device_type','web');query.set('site','cm');
- const headers=new Headers({Accept:staticResource?'*/*':'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'});
+ const headers=new Headers({Accept:'application/json',Origin:'https://web.cloudmoonapp.com',Referer:'https://web.cloudmoonapp.com/'});
  for(const name of ['x-user-language','x-user-locale']){
   const value=body.headers?.[name];if(typeof value==='string'&&value.length<=100&&!/[\r\n]/.test(value))headers.set(name,value);
  }
