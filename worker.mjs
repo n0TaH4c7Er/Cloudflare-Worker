@@ -88,7 +88,7 @@ export class RelayHub {
   const used=Number(row.requests),cutoff=Math.min(90000,Math.max(1000,Number(this.env.NEW_SESSION_CUTOFF)||60000));
   const retryAfter=Math.max(1,Math.ceil((Date.parse(day+'T00:00:00Z')+86400000-Date.now())/1000));
   const path=new URL(request.url).pathname;
-  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-01.cloudflare-gust-pool4',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
+  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-06.cloudflare-burst-spool1',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
   if(request.method==='POST'&&['/sessions','/cloudmoon-servers','/cloudmoon-read','/cloudmoon-api'].includes(path)&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
   return new Promise(resolve=>{const res=new HttpResponse(resolve);request.signal.addEventListener('abort',()=>res.abort(),{once:true});Promise.resolve(this.handler(requestAdapter(request),res)).catch(error=>{if(!res.headersSent){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Relay request failed'}));}else res.abort();});});
  }
@@ -248,10 +248,36 @@ class HttpWorldDataSocket extends EventTarget{
 }
 
 
-const VERSION='2026-11-01.cloudflare-gust-pool4';
+const VERSION='2026-11-06.cloudflare-burst-spool1';
 const targets=new Set((env.ALLOWED_TARGETS||'').split(',').map(x=>x.trim()).filter(Boolean).map(x=>x==='*'?x:new URL(x).href));
 const instanceId=randomUUID(),closedSessions=new Map();
-const key=env.RELAY_KEY,sessions=new Map(),limit=2097152,queueLimit=8*1024*1024;
+const key=env.RELAY_KEY,sessions=new Map(),limit=2097152,queueLimit=32*1024*1024;
+const spool=ctx.storage.sql;
+spool.exec('CREATE TABLE IF NOT EXISTS receive_spool (session TEXT, event INTEGER, part INTEGER, data BLOB, PRIMARY KEY(session,event,part))');
+// Socket sessions are transient. A new relay instance cannot resume old sockets.
+spool.exec('DELETE FROM receive_spool');
+function spillEvent(s,e){
+ if(e._spilled)return;
+ const wire=e._memoryWire;
+ try{for(let at=0,part=0;at<wire.length;at+=256*1024,part++)spool.exec('INSERT INTO receive_spool VALUES (?,?,?,?)',s.id,e.id,part,wire.subarray(at,at+256*1024));}
+ catch(error){spool.exec('DELETE FROM receive_spool WHERE session=? AND event=?',s.id,e.id);throw error;}
+ e._spilled=true;e._memoryWire=null;delete e.bytes;delete e.base64;delete e.text;s.memoryBytes-=e._bytes;
+}
+function readEventWire(s,e){
+ if(!e._spilled)return e._memoryWire;
+ const parts=[...spool.exec('SELECT data FROM receive_spool WHERE session=? AND event=? ORDER BY part',s.id,e.id)];
+ const wire=Buffer.concat(parts.map(p=>Buffer.from(p.data)));
+ if(wire.length!==e._bytes)throw Error('Incomplete relay replay data');return wire;
+}
+function trimReceiveMemory(){
+ let total=[...sessions.values()].reduce((n,x)=>n+(x.memoryBytes||0),0);
+ for(const s of sessions.values())for(const e of s.events){
+  if(!s.binary)continue;
+  if(e._spilled)continue;
+  if(s.memoryBytes<=4*1024*1024&&total<=8*1024*1024)break;
+  spillEvent(s,e);total-=e._bytes;
+ }
+}
 if(!targets.size||!key)throw Error('Set ALLOWED_TARGETS and RELAY_KEY.');
 function dispose(s,reason='Client closed session'){
  if(s.disposed)return;s.disposed=true;
@@ -259,6 +285,7 @@ function dispose(s,reason='Client closed session'){
  closedSessions.set(s.id,{reason,time:Date.now()});
  if(closedSessions.size>1000)closedSessions.delete(closedSessions.keys().next().value);
  try{if(s.paused)s.ws.resume?.();s.ws.close();}catch{}
+ spool.exec('DELETE FROM receive_spool WHERE session=?',s.id);s.events.length=0;s.bytes=0;s.memoryBytes=0;
  sessions.delete(s.id);s.wake?.();wakeSenders(s);s.streamResponse?.end();
 }
 function applyReceivePressure(s){
@@ -289,15 +316,22 @@ function decodeBatch(bytes){
 function push(s,e){
  if(s.disposed)return;e.id=++s.eventSeq;
  const wire=s.binary?binaryEvent(e):JSON.stringify(e)+'\n',size=Buffer.byteLength(wire);
- if(size>4*1024*1024||s.bytes+size>queueLimit||[...sessions.values()].reduce((n,x)=>n+x.bytes,0)+size>24*1024*1024){dispose(s,'Cloudflare relay receive buffer full; reconnect with a stable connection');return;}
- Object.defineProperties(e,{_wire:{value:wire},_bytes:{value:size}});
- s.bytes+=size;s.peakBytes=Math.max(s.peakBytes||0,s.bytes);s.events.push(e);applyReceivePressure(s);s.pump?.();s.wake?.();
+ if(size>8*1024*1024||s.bytes+size>queueLimit||[...sessions.values()].reduce((n,x)=>n+x.bytes,0)+size>64*1024*1024){dispose(s,'Cloudflare burst replay limit reached; browser is not keeping up');return;}
+ Object.defineProperties(e,{_wire:{get:()=>readEventWire(s,e)},_bytes:{value:size},_memoryWire:{value:wire,writable:true},_spilled:{value:false,writable:true}});
+ // Binary replay only needs the encoded wire, not a second copy of the payload.
+ if(s.binary){delete e.bytes;delete e.text;delete e.base64;}
+ s.memoryBytes=(s.memoryBytes||0)+size;s.bytes+=size;s.peakBytes=Math.max(s.peakBytes||0,s.bytes);s.events.push(e);
+ // Legacy JSON polling requires payload fields. Reject its burst instead of spilling it.
+ try{if(s.binary)trimReceiveMemory();else if(s.bytes>4*1024*1024){dispose(s,'Use binary transport for large world transfers');return;}}
+ catch{dispose(s,'Cloudflare replay storage unavailable or quota exhausted');return;}
+ applyReceivePressure(s);s.pump?.();s.wake?.();
 }
 function acknowledge(s,value=0){
  const ack=Number(value);
  if(!Number.isSafeInteger(ack)||ack<0||ack>s.eventSeq)throw Error('Invalid receive acknowledgement');
  if(ack>s.acked){
-  let count=0;while(count<s.events.length&&s.events[count].id<=ack)s.bytes-=s.events[count++]._bytes;
+  let count=0;while(count<s.events.length&&s.events[count].id<=ack){const e=s.events[count++];s.bytes-=e._bytes;if(!e._spilled)s.memoryBytes-=e._bytes;}
+  spool.exec('DELETE FROM receive_spool WHERE session=? AND event<=?',s.id,ack);
   s.events.splice(0,count);s.bytes=Math.max(0,s.bytes);s.acked=ack;applyReceivePressure(s);
  }
 }
@@ -323,7 +357,7 @@ const handler=async(req,res)=>{
  res.setHeader('Cache-Control','no-store');
  res.setHeader('Access-Control-Max-Age','600');
  const reply=(code,data)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
- if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true});return;}
+ if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,receiveSpool:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true});return;}
  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
  if(req.headers['x-relay-key']!==key){reply(401,{error:'Invalid relay key'});return;}
  try{
@@ -362,7 +396,7 @@ const handler=async(req,res)=>{
   }
   const m=path.match(/^\/sessions\/([a-f0-9-]+)(\/send|\/ack|\/stream|\/status)?$/),s=m&&sessions.get(m[1]);
   if(!s){const ended=m&&closedSessions.get(m[1]);reply(ended?410:404,{error:ended?ended.reason:'Session not found; the relay may have restarted',instanceId});return;}s.last=Date.now();
-  if(req.method==='GET'&&m[2]==='/status'){reply(200,{queuedBytes:s.bytes,peakQueueBytes:s.peakBytes||0,paused:!!s.paused,receivePauses:s.pauseCount||0,instanceId});return;}
+  if(req.method==='GET'&&m[2]==='/status'){reply(200,{queuedBytes:s.bytes,memoryQueueBytes:s.memoryBytes||0,spooledBytes:s.bytes-(s.memoryBytes||0),peakQueueBytes:s.peakBytes||0,paused:!!s.paused,receivePauses:s.pauseCount||0,instanceId});return;}
   if(req.method==='DELETE'){dispose(s);reply(200,{});return;}
   if(req.method==='POST'&&m[2]==='/ack'){acknowledge(s,body.received);reply(200,{received:s.acked});return;}
   if(req.method==='POST'&&m[2]==='/send'){
