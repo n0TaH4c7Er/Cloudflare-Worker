@@ -1,3 +1,4 @@
+import {handleSaveProxy,SAVE_DEFAULTS} from './save-proxy.mjs';
 // HTTP compatibility layer for the existing retry-safe binary relay core.
 import {Buffer} from 'node:buffer';
 import {EventEmitter} from 'node:events';
@@ -88,13 +89,14 @@ export class RelayHub {
   const used=Number(row.requests),cutoff=Math.min(90000,Math.max(1000,Number(this.env.NEW_SESSION_CUTOFF)||60000));
   const retryAfter=Math.max(1,Math.ceil((Date.parse(day+'T00:00:00Z')+86400000-Date.now())/1000));
   const path=new URL(request.url).pathname;
-  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,version:'2026-11-06.cloudflare-burst-spool1',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
+  if(request.method==='GET'&&path==='/health')return Response.json({ok:true,saveProxy:true,version:'2026-11-07.vm-save-relay1',protocol:2,binaryProtocol:3,sharedWorlds:true,httpWorlds:true,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true,pool:{acceptingNewSessions:used<cutoff,httpRequestsObserved:used,newSessionCutoff:cutoff,day,retryAfter}}, {headers:cors});
   if(request.method==='POST'&&['/sessions','/cloudmoon-servers','/cloudmoon-read','/cloudmoon-api'].includes(path)&&used>=cutoff)return Response.json({error:'Cloudflare quota reserve: new sessions use the fallback relay',retryAfter},{status:503,headers:cors});
   return new Promise(resolve=>{const res=new HttpResponse(resolve);request.signal.addEventListener('abort',()=>res.abort(),{once:true});Promise.resolve(this.handler(requestAdapter(request),res)).catch(error=>{if(!res.headersSent){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Relay request failed'}));}else res.abort();});});
  }
 }
 const cors={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type,X-Relay-Key,X-Relay-Ack','Access-Control-Allow-Methods':'GET,POST,DELETE,OPTIONS','Access-Control-Max-Age':'600','Cache-Control':'no-store'};
 export default {async fetch(request,env){
+ if(new URL(request.url).pathname.startsWith('/save-proxy/'))return handleSaveProxy(request,{...SAVE_DEFAULTS,...env});
  if(request.method==='OPTIONS'&&(!env.RELAY_KEY||!env.ALLOWED_TARGETS))return new Response(null,{status:204,headers:cors});
  if(!env.RELAY_KEY||!env.ALLOWED_TARGETS)return Response.json({error:'Configure RELAY_KEY and ALLOWED_TARGETS'},{status:503,headers:cors});
  if(request.method!=='OPTIONS'&&new URL(request.url).pathname!=='/health'&&request.headers.get('X-Relay-Key')!==env.RELAY_KEY)return Response.json({error:'Invalid relay key'},{status:401,headers:cors});
@@ -248,7 +250,7 @@ class HttpWorldDataSocket extends EventTarget{
 }
 
 
-const VERSION='2026-11-06.cloudflare-burst-spool1';
+const VERSION='2026-11-07.vm-save-relay1';
 const targets=new Set((env.ALLOWED_TARGETS||'').split(',').map(x=>x.trim()).filter(Boolean).map(x=>x==='*'?x:new URL(x).href));
 const instanceId=randomUUID(),closedSessions=new Map();
 const key=env.RELAY_KEY,sessions=new Map(),limit=2097152,queueLimit=32*1024*1024;
@@ -357,7 +359,7 @@ const handler=async(req,res)=>{
  res.setHeader('Cache-Control','no-store');
  res.setHeader('Access-Control-Max-Age','600');
  const reply=(code,data)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
- if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,receiveSpool:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true});return;}
+ if(req.method==='GET'&&req.url==='/health'){reply(200,{ok:true,saveProxy:true,receiveSpool:true,version:VERSION,protocol:2,binaryProtocol:3,instanceId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),sharedWorlds:true,worldTransport:'https-streaming',webRTC:false,receiveStream:true,gustWisp:true,cloudmoonServers:true,cloudmoonPlayerRead:true,cloudmoonApi:true});return;}
  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
  if(req.headers['x-relay-key']!==key){reply(401,{error:'Invalid relay key'});return;}
  try{
