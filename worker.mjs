@@ -1,3 +1,28 @@
+// Runs inside the existing RelayHub Durable Object before quota/session handling.
+async function paperDirectory(request,ctx,env){
+ const url=new URL(request.url),headers={'Access-Control-Allow-Origin':'*','Access-Control-Allow-Headers':'Content-Type,X-Relay-Key','Access-Control-Allow-Methods':'GET,POST,OPTIONS','Cache-Control':'no-store'};
+ const json=(status,data)=>Response.json(data,{status,headers});
+ if(request.method==='OPTIONS')return new Response(null,{status:204,headers});
+ if(url.pathname==='/paper-directory'&&request.headers.get('X-Relay-Key')!==env.RELAY_KEY)return json(401,{error:'Invalid relay key'});
+ if(url.pathname==='/paper-directory'&&request.method==='POST'){
+  if(Number(request.headers.get('Content-Length'))>4096)return json(413,{error:'Too large'});
+  const text=await request.text();if(text.length>4096)return json(413,{error:'Too large'});
+  let record;try{record=JSON.parse(text);const endpoint=new URL(record.http);
+   if(endpoint.protocol!=='https:'||!endpoint.hostname.endsWith('.trycloudflare.com')||endpoint.pathname!=='/'||endpoint.username||endpoint.password||endpoint.port||endpoint.search||endpoint.hash||!/^\/minecraft\/[a-f0-9]{24}$/.test(record.path))throw Error();
+   record={http:endpoint.origin,path:record.path,expiresAt:Date.now()+180000};
+  }catch{return json(400,{error:'Invalid personal server address'});}
+  await ctx.storage.put('paper-directory',record);return json(200,{ok:true,expiresAt:record.expiresAt});
+ }
+ const record=await ctx.storage.get('paper-directory');
+ if(!record||record.expiresAt<Date.now())return json(503,{error:'Personal Paper server is offline'});
+ if(url.pathname==='/paper-directory'&&request.method==='GET')return json(200,{http:record.http,wss:'wss://'+url.host+'/paper/'+record.path.split('/').pop(),expiresAt:record.expiresAt});
+ if(url.pathname==='/paper/'+record.path.split('/').pop()&&request.headers.get('Upgrade')?.toLowerCase()==='websocket'){
+  const target=record.http+record.path;
+  return fetch(new Request(target,request));
+ }
+ return json(404,{error:'Unknown Paper endpoint'});
+}
+
 import {handleSaveProxy,SAVE_DEFAULTS} from './save-proxy.mjs';
 // HTTP compatibility layer for the existing retry-safe binary relay core.
 import {Buffer} from 'node:buffer';
@@ -84,6 +109,8 @@ export class RelayHub {
   this.sql.exec('CREATE TABLE IF NOT EXISTS relay_usage (day TEXT PRIMARY KEY, requests INTEGER NOT NULL)');
  }
  fetch(request){
+  const paperPath=new URL(request.url).pathname;
+  if(paperPath==='/paper-directory'||paperPath.startsWith('/paper/'))return paperDirectory(request,this.ctx,this.env);
   const day=new Date().toISOString().slice(0,10);
   const row=[...this.sql.exec('INSERT INTO relay_usage (day,requests) VALUES (?,1) ON CONFLICT(day) DO UPDATE SET requests=requests+1 RETURNING requests',day)][0];
   const used=Number(row.requests),cutoff=Math.min(90000,Math.max(1000,Number(this.env.NEW_SESSION_CUTOFF)||60000));
@@ -99,7 +126,7 @@ export default {async fetch(request,env){
  if(new URL(request.url).pathname.startsWith('/save-proxy/'))return handleSaveProxy(request,{...SAVE_DEFAULTS,...env});
  if(request.method==='OPTIONS'&&(!env.RELAY_KEY||!env.ALLOWED_TARGETS))return new Response(null,{status:204,headers:cors});
  if(!env.RELAY_KEY||!env.ALLOWED_TARGETS)return Response.json({error:'Configure RELAY_KEY and ALLOWED_TARGETS'},{status:503,headers:cors});
- if(request.method!=='OPTIONS'&&new URL(request.url).pathname!=='/health'&&request.headers.get('X-Relay-Key')!==env.RELAY_KEY)return Response.json({error:'Invalid relay key'},{status:401,headers:cors});
+ if(request.method!=='OPTIONS'&&new URL(request.url).pathname!=='/health'&&!(new URL(request.url).pathname.startsWith('/paper/')&&request.headers.get('Upgrade')?.toLowerCase()==='websocket')&&request.headers.get('X-Relay-Key')!==env.RELAY_KEY)return Response.json({error:'Invalid relay key'},{status:401,headers:cors});
  return env.RELAY.get(env.RELAY.idFromName('math-practice-relay-v1')).fetch(request);
 }};
 
